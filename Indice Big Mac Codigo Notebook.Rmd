@@ -1,0 +1,424 @@
+---
+title: "Resultados del Indice Big Mac Agosto 2020"
+output:
+  html_document:
+    df_print: paged
+date: "11-08-2020"
+autor: Ariel Malowany
+---
+
+Paquetes utilizados:
+
+* readxl
+* tidyverse
+* stringr
+* knitr
+* lubridate
+* modelr
+* tinytext
+* ggrepel
+* broom
+
+```{r paquetes, include=FALSE}
+
+library(readxl)
+library(tidyverse)
+library(stringr)
+library(knitr)
+library(lubridate)
+library(modelr)
+library(tinytex)
+library(ggrepel)
+library(broom)
+
+```
+
+```{r Opciones globales, include = FALSE}
+
+opts_chunk$set(warning = FALSE, message = FALSE)
+
+```
+
+```{r importa precios y PIB pc,results = 'hide'}
+
+# Los paises son los de referencia del Banco Central de Uruguay para calcular el tipo de cambio real global y regional
+
+precio_big_mac <- read_excel("Precio Big Mac.xlsx") 
+
+pib_pc <- read_excel("API_NY.GDP.PCAP.CD_DS2_es_excel_v2_1217907.xls")
+
+pib_pc <- pib_pc %>% 
+            filter(`Country Name` %in% precio_big_mac$`Country Name`) %>% 
+            select(1, 2, ncol(pib_pc))
+
+colnames(pib_pc)[3] <- str_c("pib_pc", "_", colnames(pib_pc)[ncol(pib_pc)])
+
+# Para el area euro se hace un promedio del precio y del PIB pc 
+
+base_big_mc <- precio_big_mac %>% 
+                 select(-4) %>% 
+                 left_join(.,pib_pc, by="Country Name") %>%
+                 group_by(Currency) %>% 
+                 mutate(
+                   preciobm = mean(`Precio Big Mac`, na.rm = TRUE),
+                   pib_pc_2019 = mean(pib_pc_2019, na.rm=TRUE),
+                   `Country Name` = ifelse(Currency == "Euro", "Euro area", `Country Name`)
+                 ) %>%
+                 select(
+                   `Country Name`,
+                    Currency,
+                    preciobm,
+                    pib_pc_2019
+                 ) %>% 
+                 unique() 
+             
+```
+
+```{r importa cotizaciones, results = 'hide', message = FALSE, warning = FALSE}
+
+cotizaciones <- read_excel("Cotizaciones.xlsx", col_types = c("text", "numeric", "numeric", "numeric", "numeric", "numeric"))
+
+# Elimino las filas de comentarios.
+
+cotizaciones <- cotizaciones[-(40:46), ]
+
+numero_serie <- as.integer(colnames(cotizaciones)[2:6])
+
+fechas <- as.Date(numero_serie, origin = "1899-12-30")
+
+colnames(cotizaciones)[2:6] <- str_c("dolar", day(fechas), month(fechas), year(fechas))
+
+# Las monedas con (1) en la columna currency están expresadas en cantidad de dolares por 1 unidad de moneda, y se quiere trabajar con cantidad de moneda por 1 dolar (hay que calcular la inversa)
+
+cotizaciones[str_detect(cotizaciones$Currency, "(1)"), ][, 2:6] <- cotizaciones[str_detect(cotizaciones$Currency, "(1)"), ][, 2:6]^-1 # Reemplazo las filas por la inversa
+
+caracter <- "\\(1\\)" 
+
+cotizaciones[str_detect(cotizaciones$Currency, "(1)"), ][, 1] <- str_remove(cotizaciones[str_detect(cotizaciones$Currency, "(1)"), ][[1]], caracter)
+
+# El dato de Argentina sale del Banco Central de Argentina.
+
+cotizaciones[40, 1] <- "Peso argentino" 
+
+output <- list()
+
+fechas <- c(3:7)
+
+for (i in seq_along(fechas)) {
+  output[[i]] <- read_excel(str_c("Argentina ", fechas[[i]], "-", "8", "-", "2020", ".xlsx"),
+                            
+  col_types = c("text", "numeric", "numeric"), skip = 1)
+  
+  # Por un error de puntuación debo dividir entre 10 millones.
+
+  cotizaciones[40, i + 1] <- filter(output[[i]], MONEDA == "Dolar Referencia Com 3500")[[3]]/10000000 
+  
+}
+
+cotizaciones <- cotizaciones %>%
+                  filter(.$Currency %in% precio_big_mac$Currency == TRUE) %>%
+                  select(1, ncol(cotizaciones))
+```
+
+```{r calcula el indice, results = 'hide'}
+
+base_big_mc <- base_big_mc %>%
+                 left_join(., cotizaciones, by = "Currency") %>%
+                 mutate(preciobmUSD = preciobm / dolar782020)
+
+ajuste_PIBpc <- lm(preciobmUSD ~ pib_pc_2019, data = base_big_mc)
+
+base_big_mc <- base_big_mc %>%
+                 add_predictions(ajuste_PIBpc, var = "precio_bm_ajustado")
+
+# Las predicciones serán utilizadas para calcular el tipo de cambio real según productividades.
+
+precio_USA <- filter(base_big_mc, `Country Name` == "Estados Unidos")["preciobm"][[1]]
+
+precio_USA_ajustado <- filter(base_big_mc, `Country Name` == "Estados Unidos")["precio_bm_ajustado"][[1]]
+
+base_big_mc <- base_big_mc %>%
+                 mutate(
+                   "tc_implicito" = preciobm / precio_USA,
+                   "indiceUSA" = (tc_implicito / dolar782020 - 1) * 100,
+                   "tcr_productividades" = precio_USA_ajustado / precio_bm_ajustado,
+                   "tcr_implicito" = precio_USA / preciobmUSD,
+                   "indice_USA_ajustado" = (tcr_productividades / tcr_implicito - 1) * 100
+                 )
+
+```
+
+### ¿Qué es el Índice Big Mac?
+
+El Índice Big Mac es un indicador simple para comparar el tipo de cambio de mercado con el tipo de cambio que asegura la paridad de poderes de compra. Fue creado por la revista *The Economist* en 1986, y requiere  datos facilmente disponibles para su elaboración.
+
+### Elaboración del Índice Big Mac simple
+
+```{r, echo = FALSE}
+
+precio_UY <- filter(base_big_mc,`Country Name`== "Uruguay")[["preciobm"]]
+
+dolar_UY <- round(filter(base_big_mc,`Country Name`== "Uruguay")[[5]], 2)
+
+indice_UY <- round(filter(base_big_mc, `Country Name`== "Uruguay")[["indiceUSA"]], 2)
+
+tc_ppp_uy <- round(precio_UY/precio_USA,2)
+
+tcr_uy <- round(filter(base_big_mc, `Country Name`== "Uruguay")[["tcr_implicito"]], 2)
+
+tcr_arg <- round(filter(base_big_mc, `Country Name` == "Argentina")[["tcr_implicito"]], 2)
+
+tcr_bra <- round(filter(base_big_mc, `Country Name` == "Brasil")[["tcr_implicito"]], 2)
+
+```
+
+La hamburguesa en Uruguay cuesta `r precio_UY` pesos uruguayos, mientras que en Estados Unidos cuesta `r precio_USA` dólares. La cotización del dólar implícita es `r tc_ppp_uy` pesos por 1 dolar. No obstante, la cotización del dolar en el mercado el 7 de Agosto de 2020 fue de `r dolar_UY` pesos uruguayos. De esa manera, el dolar en Uruguay está `r round(abs(tc_ppp_uy/dolar_UY - 1),2)*100`% más alto de lo necesario para asegurar la igualdad del precio de la Big Mac.
+
+Si el Índice Big Mac de un país es positivo, la cotización del dolar es más baja de lo que debería en ese país. Si es negativo, el dolar está más alto de lo que debería en ese país.
+
+### Resultados Índice Big Mac simple
+
+```{r Gráfico del Indice Big Mac}
+
+base_big_mc$`Country Name` <- factor(base_big_mc$`Country Name`,
+  levels = base_big_mc$`Country Name`[order(base_big_mc$indiceUSA)]
+)
+
+ggplot(base_big_mc, aes(x = `Country Name`, y = `indiceUSA`)) +
+  geom_hline(
+    yintercept = 0,
+    color = "#4393C3",
+    size = 1,
+    linetype = "dotted"
+  ) +
+  geom_point(aes(fill = `Country Name`),
+    size = 6,
+    shape = 21,
+    color = "black",
+    stroke = 1
+  ) +
+  geom_label(aes(
+    label = `Country Name`,
+    fill = `Country Name`,
+    fontface = "bold"
+  ),
+  color = c("black", "black", "white", "black", "white", "white", "black", "black"),
+  data = base_big_mc,
+  nudge_y = -9,
+  size = 3
+  ) +
+  geom_text(aes(label = str_c(round(indiceUSA, 2), "%")),
+    nudge_y = -4.5,
+    data = base_big_mc
+  ) +
+  scale_x_discrete(labels = NULL) +
+  scale_y_continuous(
+    breaks = (seq(-60, 10, by = 10)),
+    labels = c("-60%", "-50%", "-40%", "-30%", "-20%", "-10%", "0%", "10%")
+  ) +
+  theme(legend.position = "none") +
+  scale_fill_brewer(palette = "Blues") +
+  scale_colour_brewer(palette = "Blues") +
+  labs(
+    x = "País",
+    y = "Índice Big Mac (%)",
+    title = "Gráfico 1. Índice Big Mac, países seleccionados"
+  )
+
+```
+
+En el gráfico se aprecia que el tipo de cambio moneda local por dolar en México, China, Brasil, Argentina, Uruguay y Reino Unido es mayor al de equilibrio según la paridad de poderes de compra. En todos esos países la Big Mac expresada en dólares cuesta menos que en Estados Unidos. Por otra parte, los países del área Euro tendrían el tipo de cambio euro por dolar menor al de equilibrio, por lo cual la Big Mac expresada en dólares es más cara que en Estados Unidos.
+
+A continuación se presenta una tabla resumen de los resultados.
+
+```{r Tabla resumen Indice Big Mac, results = 'hide'}
+
+resumen_indice_simple <- base_big_mc %>% 
+                           select(1,2,9) %>% 
+                           kable(.,
+                             format = "simple",
+                             digits = 2,
+                             caption = "Tabla 1. Índice Big Mac simple",
+                             col.names = c("País", "Moneda", "Indice Big Mac simple (%)")
+  )
+
+```
+
+```{r Resultados Indice Simple}
+
+# Tuve que separar los últimos 2 chunks porque ejecutar todo junto por algún motivo printeaba un NA
+
+resumen_indice_simple 
+
+```
+
+Para Uruguay, se aprecia que el tipo de cambio nominal de equilibrio según la paridad de poderes de compra es `r tc_ppp_uy` pesos por 1 dolar, mientras que el valor de mercado es `r dolar_UY`, de ahí que el Índice Big Mac simple sea `r indice_UY` %. Para alcanzar el equilibrio, la moneda uruguaya debería apreciarse `r indice_UY`% respecto al dolar.
+
+Respecto a Brasil y Argentina, Uruguay está más cerca de la cotización del dolar que asegura el equilibrio. Esto también implica que las exportaciones uruguayas son menos competitivas que las de Argentina y Brasil, lo cual se puede ver con más claridad al comparar el tipo de cambio real implícito en los precios de la Big Mac para Uruguay (`r tcr_uy`), con el de Argentina (`r tcr_arg`) y Brasil (`r tcr_bra`).
+
+\newpage
+
+### Índice Big Mac ajustado
+
+Los resultados anteriores podrían tener un problema. El efecto *Harrod-Balassa-Samuelson* implica que el tipo de cambio real es mayor en los países con niveles más altos de productividad. 
+
+```{r Gráfico Precio Big Mac y PIB per cápita}
+
+ggplot(base_big_mc, aes(x = `pib_pc_2019`, y = `preciobmUSD`)) + 
+  geom_point(aes(fill = `Country Name`),
+    size = 4,
+    shape = 21,
+    color = "black",
+    stroke = 1
+  ) + 
+  geom_smooth(
+    se = FALSE,
+    method = lm,
+    color = "#4393C3"
+  ) + 
+  geom_label_repel(
+    aes(
+    label = `Country Name`,
+    fill = `Country Name`,
+    fontface = "bold"
+  ),
+   color = c("black", "black", "white", "black", "white", "white", "black", "white"),
+   data = base_big_mc,
+   size = 3,
+   nudge_y = 0.4
+  ) + 
+  theme(legend.position = "none") + 
+  scale_fill_brewer(palette = "Blues") + 
+  scale_colour_brewer(palette = "Blues") +
+  scale_y_continuous(breaks = (seq(2, 6, by = 0.5))) + 
+  scale_x_continuous(
+    breaks = seq(5000, 65000, by = 5000),
+    labels = str_c(seq(5000,65000,by=5000)/1000,".","000")
+  ) +
+  labs(
+    x = "PIB per cápita en dólares",
+    y = "Precio Big Mac en dólares",
+    title = "Gráfico 2. Precio Big Mac y PIB per cápita"
+  )  
+
+```
+
+El efecto sería más notable con un conjunto más grande de datos. Igualmente, a modo ilustrativo, el gráfico confirmaría que el precio de la Big Mac en dólares tiene una correlación positiva con el PIB per cápita.
+
+Para ajustar el Índice Big Mac, se realiza una regresión simple entre el precio de la Big Mac en dólares y el PIB per cápita en dólares, y se obtienen estimaciones del precio. Es posible calcular el tipo de cambio real de equilibrio según las productividades, y luego el tipo de cambio real implícito en el precio de la Big Mac. 
+
+Si el tipo de cambio real según el precio de la Big Mac es inferior al de equilibrio, entonces la moneda del país debería depreciarse para alcanzar el equilibrio.  
+
+### Resultados de la regresión
+
+```{r Resultados del modelo}
+
+kable(tidy(ajuste_PIBpc), caption = "Tabla 2. Resultados del Modelo")
+
+```
+
+```{r Ajuste del Modelo}
+
+kable(glance(ajuste_PIBpc), caption = "Tabla 3. Indicadores de ajuste del modelo")
+
+```
+
+La correlación entre el precio de la Big Mac y el PIB per cápita es positiva y significativa a un nivel de confianza del 5%.
+
+\newpage
+
+### Resultados Índice Big Mac ajustado
+
+
+```{r Gráfico del Indice Big Mac ajustado}
+
+base_big_mc$`Country Name` <- factor(base_big_mc$`Country Name`,
+  levels = base_big_mc$`Country Name`[order(base_big_mc$indice_USA_ajustado)]
+)
+
+ggplot(base_big_mc, aes(x = `Country Name`, y = `indice_USA_ajustado`)) +
+  geom_hline(
+    yintercept = 0,
+    color = "#4393C3",
+    size = 1,
+    linetype = "dotted"
+  ) +
+  geom_point(aes(fill = `Country Name`),
+    size = 6,
+    shape = 21,
+    color = "black",
+    stroke = 1
+  ) +
+  geom_label(aes(
+    label = `Country Name`,
+    fill = `Country Name`,
+    fontface = "bold"
+  ),
+  color = c("white", "black", "black", "black", "white", "black", "black", "white"),
+  data = base_big_mc,
+  nudge_y = -9,
+  size = 3
+  ) +
+  geom_text(aes(label = str_c(round(indice_USA_ajustado, 2), "%")),
+    nudge_y = -4.5,
+    data = base_big_mc
+  ) +
+  scale_x_discrete(labels = NULL) +
+  scale_y_continuous(
+    breaks = (seq(-60, 10, by = 10)),
+    labels = c("-60%", "-50%", "-40%", "-30%", "-20%", "-10%", "0%", "10%")
+  ) +
+  theme(legend.position = "none") +
+  scale_fill_brewer(palette = "Blues") +
+  scale_colour_brewer(palette = "Blues") +
+  labs(
+    x = "País",
+    y = "Índice Big Mac Ajustado (%)",
+    title = "Gráfico 2. Índice Big Mac Ajustado, países seleccionados"
+  )
+
+```
+
+En el gráfico se aprecia que México y China tendrían un tipo de cambio superior al de equilibrio, y deberían apreciar sus monedas en 24.7% y 5.51% respectivamente para alcanzar el equilibrio. Por otra parte, Reino Unido, Brasil, Argentina y Uruguay tienen tipo de cambio inferior al de equilibrio, por lo cual sus monedas deberían depreciarse en el porcentaje indicado en el gráfico para asegurar el equilibrio.
+
+A continuación se presenta una tabla resumen de los resultados.
+
+```{r Tabla Indice Big Mac ajustado, results = 'hide'}
+
+resumen_indice_ajustado <- base_big_mc %>%
+                             select(1, 2, 9, 12) %>%
+                             kable(.,
+                               format = "simple",
+                               digits = 2,
+                               caption = "Tabla 4. Índice Big Mac ajustado",
+                               col.names = c("País", "Moneda", "Indice Big Mac simple (%)", "Indice Big Mac ajustado (%)")
+                             )
+
+```
+
+```{r Resumen Indice Ajustado}
+
+# Tuve que separar los últimos 2 chunks porque ejecutar todo junto por algún motivo printeaba un NA
+
+resumen_indice_ajustado
+
+```
+
+
+En conclusión, los resultados cambian significativamente al considerar el tipo de cambio real de equilibrio según la paridad de poderes de compra (valor unitario), y el tipo de cambio real de equilibrio según el enfoque de los diferenciales de productividad.
+
+Para Uruguay, se aprecia que el tipo de cambio real de equilibrio (según el enfoque de las productividades) es 1.43, mientras que el tipo de cambio real implícito en los precios de la Big Mac es `r tcr_uy`. Para alcanzar el equilibrio, la depreciación en Uruguay debería ser de 23%, mientras que en Argentina de 22% y en Brasil 15%.
+
+### Referencias
+
+Información del Índice Big Mac en <https://www.economist.com/news/2020/07/15/the-big-mac-index>
+
+Cotización del peso argentino en <http://www.bcra.gov.ar/PublicacionesEstadisticas/Cotizaciones_por_fecha.asp>
+
+Cotizaciones de monedas respecto al dólar en <https://www.imf.org/external/np/fin/data/param_rms_mth.aspx>
+
+Base de datos del PIB per cápita en <https://datos.bancomundial.org/indicador/NY.GDP.PCAP.CD>
+
+
+
+
